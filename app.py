@@ -592,4 +592,3 @@ if mvps:
     st.success("Aftenens MVP: " + ", ".join(pid2name.get(p,'?') for p in mvps))
 else:
     st.caption("MVP vises når der er registreret fremmøde/kampe i dag.")
-'''
