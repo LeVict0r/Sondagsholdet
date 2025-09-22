@@ -1,8 +1,7 @@
-
 import streamlit as st
 import sqlite3
 from datetime import date
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 import random
 import pandas as pd
 
@@ -46,13 +45,13 @@ def init_db():
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
     );
-    /* New: rounds & round_matches for per-round scheduling */
+    /* Rounds pre-generated for a pool */
     CREATE TABLE IF NOT EXISTS rounds(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id INTEGER NOT NULL,
       round_index INTEGER NOT NULL,
       courts INTEGER NOT NULL,
-      is_active INTEGER NOT NULL DEFAULT 1,
+      is_active INTEGER NOT NULL DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(session_id, round_index),
       FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
@@ -90,7 +89,7 @@ def list_players() -> List[Tuple[int,str]]:
     rows = cur.fetchall(); c.close(); return rows
 
 def add_player(name: str) -> Optional[int]:
-    name = (name or "").strip()
+    name = (name or '').strip()
     if not name: return None
     c = conn(); cur = c.cursor()
     cur.execute("INSERT OR IGNORE INTO players(name) VALUES (?);", (name,))
@@ -103,7 +102,6 @@ def record_attendance(session_id: int, player_ids: List[int]):
     c = conn(); cur = c.cursor()
     for pid in player_ids:
         cur.execute("INSERT OR IGNORE INTO attendance(session_id, player_id) VALUES (?,?);", (session_id, pid))
-    # remove unchecked handled outside if needed
     c.commit(); c.close()
 
 def list_attendance(session_id: int) -> List[int]:
@@ -117,48 +115,41 @@ def remove_attendance(session_id: int, player_id: int):
     cur.execute("DELETE FROM attendance WHERE session_id=? AND player_id=?;", (session_id, player_id))
     c.commit(); c.close()
 
-def get_active_round(session_id: int) -> Optional[int]:
+def active_round(session_id: int) -> Optional[int]:
     c = conn(); cur = c.cursor()
-    cur.execute("SELECT id FROM rounds WHERE session_id=? AND is_active=1 ORDER BY round_index DESC LIMIT 1;", (session_id,))
+    cur.execute("SELECT id FROM rounds WHERE session_id=? AND is_active=1 ORDER BY round_index LIMIT 1;", (session_id,))
     row = cur.fetchone(); c.close()
     return row[0] if row else None
 
-def list_round_matches(round_id: int) -> List[sqlite3.Row]:
+def set_round_active(session_id: int, rid: int):
+    c = conn(); cur = c.cursor()
+    cur.execute("UPDATE rounds SET is_active=0 WHERE session_id=?;", (session_id,))
+    cur.execute("UPDATE rounds SET is_active=1 WHERE id=?;", (rid,))
+    c.commit(); c.close()
+
+def next_inactive_round(session_id: int) -> Optional[int]:
+    c = conn(); cur = c.cursor()
+    cur.execute("SELECT id FROM rounds WHERE session_id=? AND is_active=0 ORDER BY round_index LIMIT 1;", (session_id,))
+    row = cur.fetchone(); c.close()
+    return row[0] if row else None
+
+def clear_rounds(session_id: int):
+    c = conn(); cur = c.cursor()
+    cur.execute("DELETE FROM round_matches WHERE round_id IN (SELECT id FROM rounds WHERE session_id=?)", (session_id,))
+    cur.execute("DELETE FROM rounds WHERE session_id=?", (session_id,))
+    c.commit(); c.close()
+
+def list_round_matches(rid: int) -> List[sqlite3.Row]:
     c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
-    cur.execute("SELECT * FROM round_matches WHERE round_id=? ORDER BY court ASC, id ASC;", (round_id,))
+    cur.execute("SELECT * FROM round_matches WHERE round_id=? ORDER BY court ASC, id ASC;", (rid,))
     rows = cur.fetchall(); c.close(); return rows
 
-def create_round(session_id: int, courts: int, pairs: List[Tuple[int,Optional[int],int,Optional[int]]]) -> int:
-    """pairs: list of (s1p1,s1p2,s2p1,s2p2) in the order to assign to courts (chunked by courts size)."""
-    c = conn(); cur = c.cursor()
-    # next index
-    cur.execute("SELECT COALESCE(MAX(round_index),0)+1 FROM rounds WHERE session_id=?;", (session_id,))
-    ridx = cur.fetchone()[0]
-    cur.execute("INSERT INTO rounds(session_id, round_index, courts, is_active) VALUES (?,?,?,1);", (session_id, ridx, courts))
-    round_id = cur.lastrowid
-    # insert matches
-    court_num = 1
-    for m in pairs:
-        s1p1, s1p2, s2p1, s2p2 = m
-        is_singles = 0 if (s1p2 or s2p2) else 1
-        cur.execute("""
-            INSERT INTO round_matches(round_id, court, is_singles, s1p1, s1p2, s2p1, s2p2)
-            VALUES (?,?,?,?,?,?,?);
-        """, (round_id, court_num, int(is_singles), s1p1, s1p2, s2p1, s2p2))
-        court_num += 1
-        if court_num > courts:
-            court_num = 1
-    c.commit(); c.close()
-    return round_id
-
 def complete_match_and_log(round_match_id: int, score1: int, score2: int):
-    # mark round match completed + add to matches table
     c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
     cur.execute("SELECT * FROM round_matches WHERE id=?;", (round_match_id,))
     rm = cur.fetchone()
     if not rm:
         c.close(); return
-    # fetch session_id via round
     cur.execute("SELECT session_id FROM rounds WHERE id=?;", (rm["round_id"],))
     sid = cur.fetchone()[0]
     winning_side = 1 if score1 > score2 else 2
@@ -169,15 +160,13 @@ def complete_match_and_log(round_match_id: int, score1: int, score2: int):
     cur.execute("UPDATE round_matches SET completed=1, score1=?, score2=? WHERE id=?;", (score1, score2, round_match_id))
     c.commit(); c.close()
 
-def close_round_if_done(round_id: int):
+def round_completed(rid: int) -> bool:
     c = conn(); cur = c.cursor()
-    cur.execute("SELECT COUNT(*) FROM round_matches WHERE round_id=? AND completed=0;", (round_id,))
-    left = cur.fetchone()[0]
-    if left == 0:
-        cur.execute("UPDATE rounds SET is_active=0 WHERE id=?;", (round_id,))
-    c.commit(); c.close()
+    cur.execute("SELECT COUNT(*) FROM round_matches WHERE round_id=? AND completed=0;", (rid,))
+    left = cur.fetchone()[0]; c.close()
+    return left == 0
 
-# ----------- STANDINGS / RIVAL -----------
+# ------------- STANDINGS / RIVAL -------------
 def compute_standings(year: int) -> pd.DataFrame:
     c = conn(); cur = c.cursor()
     cur.execute("SELECT id,name FROM players;")
@@ -254,155 +243,117 @@ def compute_rivals(year: int) -> Dict[int, Dict]:
         result[A] = {"opponent_id": B, "w": w, "l": l, "meetings": -neg, "winpct": round(wr*100,1)}
     c.close(); return result
 
-# --------- SCHEDULER (round-based with odd rotation) ---------
-def count_player_round_appearances(session_id: int) -> Dict[int,int]:
-    """How many matches in rounds has each player played this session (to balance 'sidde over')."""
-    c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
-    cur.execute("SELECT id FROM rounds WHERE session_id=?;", (session_id,))
-    rids = [r[0] for r in cur.fetchall()]
-    counts = {}
-    if rids:
-        rid_tuple = "(" + ",".join("?"*len(rids)) + ")"
-        cur.execute(f"SELECT s1p1,s1p2,s2p1,s2p2 FROM round_matches WHERE round_id IN {rid_tuple};", rids)
-        rows = cur.fetchall()
-        for r in rows:
-            for pid in [r["s1p1"], r["s1p2"], r["s2p1"], r["s2p2"]]:
-                if pid:
-                    counts[pid] = counts.get(pid,0)+1
-    c.close(); return counts
-
-def last_round_partners(session_id: int) -> Dict[int,int]:
-    """Return a dict mapping player -> last partner id for last active or last round in session (for doubles)."""
-    c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
-    cur.execute("SELECT id FROM rounds WHERE session_id=? ORDER BY round_index DESC LIMIT 1;", (session_id,))
-    row = cur.fetchone()
-    if not row:
-        c.close(); return {}
-    rid = row["id"]
-    cur.execute("SELECT * FROM round_matches WHERE round_id=?;", (rid,))
-    partners = {}
-    for rm in cur.fetchall():
-        if rm["is_singles"]: continue
-        for a,b in [(rm["s1p1"], rm["s1p2"]), (rm["s2p1"], rm["s2p2"])]:
-            if a and b:
-                partners[a]=b; partners[b]=a
-    c.close(); return partners
-
-def build_round_pairs(att_ids: List[int], courts: int, use_singles_slot: bool, session_id: int) -> Tuple[List[Tuple[int,Optional[int],int,Optional[int]]], List[int]]:
-    """
-    Returns (pairs, sitting_out_list)
-    pairs: list of (s1p1,s1p2,s2p1,s2p2) sized to courts (we will assign to courts in create_round)
-    If odd number of players for doubles, rotate one to sit-out; if 4k+2 and courts>=3 and use_singles_slot -> one singles match included.
-    """
-    ids = att_ids.copy()
-    random.shuffle(ids)  # initial shuffle for variety
-    n = len(ids)
-    sitting_out = []
-
-    # determine singles slot eligibility
-    singles_allowed = use_singles_slot and (n % 4 == 2) and (courts >= 3)
-
-    # Compute play counts to choose fair sit-out
-    played_counts = count_player_round_appearances(session_id)
-    def next_sit_out(candidates: List[int]) -> int:
-        # choose the one with fewest appearances; tiebreak by name/order
-        cands = sorted(candidates, key=lambda pid: (played_counts.get(pid,0), pid))
-        return cands[0]
-
-    pairs = []
-
-    if n % 2 == 1:
-        # one must sit out
-        so = next_sit_out(ids)
-        sitting_out.append(so)
-        ids.remove(so)
-        n -= 1
-
-    if n % 4 == 2 and not singles_allowed:
-        # need one more to sit out so we have multiple of 4 for doubles
-        so2 = next_sit_out(ids)
-        if so2 not in sitting_out:
-            sitting_out.append(so2)
-        ids.remove(so2)
-        n -= 2
-
-    # partner memory: avoid last partner if possible
-    last_part = last_round_partners(session_id)
-    # make doubles teams from ids
-    teams: List[Tuple[int,Optional[int]]] = []
-    if singles_allowed and (n % 4 == 2):
-        # make as many doubles as possible; last two become singles team entries (None partners)
-        # form teams greedily avoiding last partners
-        remaining = ids[:-2]
-        singles = ids[-2:]
+# ------------- POOL SCHEDULER (all rounds up-front) -------------
+def make_teams(att_ids: List[int], mode: str) -> List[Tuple[int, Optional[int]]]:
+    ids = att_ids[:]
+    if mode == "Snake (balanceret)":
+        # deterministic by name order will be applied outside; here just keep order
+        pass
     else:
-        remaining = ids
-        singles = []
-
-    # pair remaining into doubles
-    used = set()
-    rem_sorted = remaining[:]
-    # simple heuristic: sort by how recently/least played to balance
-    rem_sorted.sort(key=lambda pid: (played_counts.get(pid,0), pid))
-    for pid in rem_sorted:
-        if pid in used: continue
-        # choose partner
-        candidates = [q for q in rem_sorted if q not in used and q != pid]
-        # avoid last partner if possible
-        avoid = last_part.get(pid)
-        pick = None
-        for q in candidates:
-            if q != avoid:
-                pick = q; break
-        if pick is None and candidates:
-            pick = candidates[0]
-        if pick is not None:
-            teams.append((pid, pick))
-            used.add(pid); used.add(pick)
-
-    # if any leftover (shouldn't happen), drop them to sitting_out
-    leftovers = [p for p in rem_sorted if p not in used]
-    for p in leftovers:
-        sitting_out.append(p)
-
-    # Add singles pseudo-team if enabled
-    if len(singles) == 2:
-        teams.append((singles[0], None))  # team X (single)
-        teams.append((singles[1], None))  # team Y (single)
-
-    # now create matches limited by courts: greedy pair adjacent teams into matches
-    # If singles entries exist, they'll pair either vs each other (single vs single) or vs doubles creating singles matches.
-    # For simplicity in "round": we create up to 'courts' matches.
-    # Strategy: prefer doubles vs doubles first; if singles entries exist and courts left, schedule single vs single.
-    doubles_teams = [t for t in teams if t[1] is not None]
-    single_entries = [t for t in teams if t[1] is None]
-
-    # create matches
-    court_slots = courts
+        random.shuffle(ids)
+    # pair as doubles by adjacent; if odd -> one sits over per round (handled by pacḱing)
+    teams = []
     i = 0
-    # pair doubles teams
-    while len(doubles_teams) >= 2 and court_slots > 0:
-        t1 = doubles_teams.pop(0)
-        t2 = doubles_teams.pop(0)
-        pairs.append((t1[0], t1[1], t2[0], t2[1]))
-        court_slots -= 1
+    while i+1 < len(ids):
+        teams.append((ids[i], ids[i+1]))
+        i += 2
+    if i < len(ids):  # odd leftover -> single entry
+        teams.append((ids[i], None))
+    return teams
 
-    # handle singles
-    if court_slots > 0 and len(single_entries) >= 2:
-        # single vs single
-        s1 = single_entries.pop(0)[0]
-        s2 = single_entries.pop(0)[0]
-        pairs.append((s1, None, s2, None))
-        court_slots -= 1
+def all_vs_all_pairs(teams: List[Tuple[int, Optional[int]]]) -> List[Tuple[Tuple[int,Optional[int]], Tuple[int,Optional[int]]]]:
+    M = []
+    for i in range(len(teams)):
+        for j in range(i+1, len(teams)):
+            M.append((teams[i], teams[j]))
+    return M
 
-    # If still courts and one single left and one doubles left, we can schedule ONE singles vs ONE of doubles players?
-    # To keep it simple and fair, we leave that for next round. (Keeps UI og flow simpelt).
+def players_in_team(team: Tuple[int, Optional[int]]) -> Set[int]:
+    return {team[0]} | ({team[1]} if team[1] else set())
 
-    return pairs, sitting_out
+def pack_into_rounds(session_id: int, courts: int, matches: List[Tuple[Tuple[int,Optional[int]], Tuple[int,Optional[int]]]]) -> List[List[Tuple[Tuple[int,Optional[int]], Tuple[int,Optional[int]]]]]:
+    """Greedy: build rounds with up to 'courts' simultaneous matches, no overlapping players within a round."""
+    rounds: List[List[Tuple[Tuple[int,Optional[int]], Tuple[int,Optional[int]]]]] = []
+    remaining = matches[:]
+    # simple fairness: shuffle order a bit
+    random.shuffle(remaining)
+    while remaining:
+        used: Set[int] = set()
+        this_round: List[Tuple[Tuple[int,Optional[int]], Tuple[int,Optional[int]]]] = []
+        i = 0
+        while i < len(remaining) and len(this_round) < courts:
+            a,b = remaining[i]
+            A = players_in_team(a)
+            B = players_in_team(b)
+            if used.isdisjoint(A) and used.isdisjoint(B):
+                this_round.append((a,b))
+                used |= A | B
+                remaining.pop(i)
+            else:
+                i += 1
+        if not this_round:
+            # if we got stuck (due to many conflicts), force take first and continue
+            a,b = remaining.pop(0)
+            this_round.append((a,b))
+        rounds.append(this_round)
+    return rounds
+
+def create_pool_rounds(session_id: int, courts: int, att_ids: List[int], mix_mode: str):
+    """Generate teams -> all-vs-all matches -> pack into rounds -> persist to DB; activate first round."""
+    # sort by name for snake-like balance
+    ids = att_ids[:]
+    # get names
+    c = conn(); cur = c.cursor()
+    cur.execute("SELECT id,name FROM players WHERE id IN (%s)" % ",".join("?"*len(ids)), ids)
+    order = {pid: name for pid, name in cur.fetchall()}
+    c.close()
+    if mix_mode == "Snake (balanceret)":
+        ids = sorted(ids, key=lambda pid: order.get(pid,"").lower())
+    else:
+        random.shuffle(ids)
+    teams = make_teams(ids, mix_mode)
+    matches = all_vs_all_pairs(teams)
+    # Convert singles-vs-doubles into TWO singles? Simplicity: keep som den er (single vs double tillades ikke) → vi lader leftover single stå over og håber på jævnt felt.
+    # Bedre: hvis sidste team er single, konverter alle deres matchups til singles mod én fra modstanderholdet -> men det kræver ekstra logik.
+    # For v3: forbud mod single-entry i pool: hvis sidste er single, dropper vi den spiller for denne pulje (sidder over første runde). De kommer med i næste pulje/runde.
+    # Derfor: hvis sidste team er (pid,None), drop det team fra denne pool og informer i UI.
+    dropped_single_pid = None
+    if teams and teams[-1][1] is None:
+        dropped_single_pid = teams[-1][0]
+        teams = teams[:-1]
+        matches = all_vs_all_pairs(teams)
+
+    rounds = pack_into_rounds(session_id, courts, matches)
+
+    # Persist
+    clear_rounds(session_id)
+    c = conn(); cur = c.cursor()
+    for idx, rd in enumerate(rounds, start=1):
+        cur.execute("INSERT INTO rounds(session_id, round_index, courts, is_active) VALUES (?,?,?,0);", (session_id, idx, courts))
+        rid = cur.lastrowid
+        court = 1
+        for (t1, t2) in rd:
+            s1p1, s1p2 = t1[0], t1[1]
+            s2p1, s2p2 = t2[0], t2[1]
+            is_singles = 0 if (s1p2 or s2p2) else 1
+            cur.execute("""
+                INSERT INTO round_matches(round_id, court, is_singles, s1p1, s1p2, s2p1, s2p2)
+                VALUES (?,?,?,?,?,?,?);
+            """, (rid, court, int(is_singles), s1p1, s1p2, s2p1, s2p2))
+            court += 1
+            if court > courts: court = 1
+    c.commit(); c.close()
+    # Activate first
+    c = conn(); cur = c.cursor()
+    cur.execute("SELECT id FROM rounds WHERE session_id=? ORDER BY round_index LIMIT 1;", (session_id,))
+    row = cur.fetchone(); c.close()
+    if row:
+        set_round_active(session_id, row[0])
+    return dropped_single_pid
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="Søndagsholdet F/S – Onepager v2", layout="wide")
-st.title("Søndagsholdet F/S – Onepager v2")
+st.set_page_config(page_title="Søndagsholdet F/S – Onepager v3", layout="wide")
+st.title("Søndagsholdet F/S – Onepager v3 (Pulje med flere baner)")
 
 import os
 os.makedirs("data", exist_ok=True)
@@ -437,7 +388,7 @@ with colL:
     sel_date = st.date_input("Dato", value=date.today())
     session_id = get_or_create_session(sel_date)
 with colR:
-    courts = st.number_input("Antal baner", min_value=1, max_value=6, value=2, step=1)
+    courts = st.number_input("Antal baner", min_value=1, max_value=6, value=3, step=1)
 
 players = list_players()
 pid2name = {pid:name for pid,name in players}
@@ -453,56 +404,35 @@ colA, colB = st.columns([1,1])
 with colA:
     if st.button("Opdatér fremmøde"):
         record_attendance(session_id, picked_ids)
-        # remove unchecked
+        # fjern dem, der ikke længere er valgt
         for pid,_ in players:
             if pid in att_ids_existing and pid not in picked_ids:
                 remove_attendance(session_id, pid)
-        st.success("Fremmøde opdateret (1 point gives automatisk i stillingen).")
+        st.success("Fremmøde opdateret (giver 1 point).")
 with colB:
-    use_singles_slot = st.toggle("Aktivér singles-slot ved 4k+2 spillere og 3+ baner", value=True, help="Hvis I er fx 6/10/14 og har mindst 3 baner, kan to spillere få en singlekamp i runden.")
+    mix_mode = st.radio("Mixing af hold", ["Snake (balanceret)","Random"], horizontal=True)
 
 att_ids = list_attendance(session_id)
 
 st.markdown("---")
 
-# Round control
-st.subheader("🎯 Runder (remix pr. runde + fair rotation ved ulige)")
-active_round_id = get_active_round(session_id)
-if active_round_id:
-    st.info("Der er en aktiv runde. Registrér resultaterne herunder. Når alle kampe er gemt, lukker runden automatisk.")
-else:
-    st.caption("Ingen aktiv runde. Tryk 'Lav næste runde' når I er klar.")
+# Pool control: generate ALL rounds based on courts
+st.subheader("🎯 Start pulje (alle runder genereres på forhånd)")
+if st.button("🚀 Start pulje med nuværende fremmøde"):
+    if len(att_ids) < 4:
+        st.error("For få spillere til en pulje (min. 4).")
+    else:
+        dropped = create_pool_rounds(session_id, courts, att_ids, mix_mode)
+        if dropped:
+            st.warning(f"Uligt antal – {pid2name.get(dropped,'?')} sidder over i denne pulje. (Kommer med i næste pulje/næste gang).")
+        rid = active_round(session_id)
+        if rid:
+            st.success("Pulje oprettet. Runder er lagt i kø. Første runde er aktiv.")
 
-col1, col2 = st.columns([1,1])
-with col1:
-    mix_mode = st.radio("Mixing", ["Snake (balanceret)","Random"], horizontal=True)
-with col2:
-    if st.button("🔁 Lav næste runde"):
-        if len(att_ids) < 2:
-            st.error("For få spillere tjekket ind.")
-        else:
-            # Build pairs and create round
-            # For snake mode, vi sorterer forudsigeligt (navn), random ellers
-            att = att_ids[:]
-            if mix_mode == "Snake (balanceret)":
-                att = [pid for pid,_ in sorted([(pid,pid2name[pid]) for pid in att], key=lambda x:x[1].lower())]
-            else:
-                random.shuffle(att)
-            pairs, sitting_out = build_round_pairs(att, courts, use_singles_slot, session_id)
-            if not pairs:
-                st.warning("Ingen kampe kunne planlægges i denne runde (måske for få spillere i forhold til baner).")
-            else:
-                rid = create_round(session_id, courts, pairs)
-                if sitting_out:
-                    st.success("Runde oprettet. Sidder over: " + ", ".join(pid2name.get(p,'?') for p in sitting_out))
-                else:
-                    st.success("Runde oprettet. Alle spiller i denne runde.")
-
-# Show active round matches
-active_round_id = get_active_round(session_id)
-if active_round_id:
-    st.markdown("#### Dagens runde – registrér vindere")
-    rms = list_round_matches(active_round_id)
+active_rid = active_round(session_id)
+if active_rid:
+    st.markdown("#### Aktiv runde – registrér vindere for hver bane")
+    rms = list_round_matches(active_rid)
     for rm in rms:
         c1, c2, c3 = st.columns([3,3,2])
         s1_names = " & ".join([pid2name.get(rm["s1p1"],"?")] + ([pid2name.get(rm["s1p2"],"?")] if rm["s1p2"] else []))
@@ -524,21 +454,29 @@ if active_round_id:
                     else:
                         complete_match_and_log(rm["id"], int(sc1), int(sc2))
                         st.success("Kamp gemt.")
-    # After loop, attempt to close round if all completed
-    if st.button("🏁 Tjek og afslut runde"):
-        close_round_if_done(active_round_id)
-        nr = get_active_round(session_id)
-        if nr:
-            st.info("Der er stadig kampe i runden, der ikke er gemt.")
-        else:
-            st.success("Runden er afsluttet. Klar til at lave næste runde.")
+    # Controls to go to next round
+    coln1, coln2 = st.columns([1,1])
+    with coln1:
+        if st.button("🏁 Afslut runde og gå til næste"):
+            if round_completed(active_rid):
+                nr = next_inactive_round(session_id)
+                if nr:
+                    set_round_active(session_id, nr)
+                    st.success("Næste runde er nu aktiv.")
+                else:
+                    st.info("Puljen er færdig – ingen flere runder.")
+            else:
+                st.warning("Der er stadig kampe i runden, som ikke er gemt.")
+    with coln2:
+        if st.button("🧹 Afbryd/ryd pulje"):
+            clear_rounds(session_id)
+            st.success("Puljen er ryddet. Du kan starte en ny.")
 
 st.markdown("---")
 
 # Archive
 st.subheader("🗂️ Kamp-arkiv")
 year_choice = st.number_input("År", min_value=2000, max_value=2100, value=date.today().year, step=1)
-# fetch rows
 c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
 cur.execute("SELECT id FROM sessions WHERE strftime('%Y', session_date)=?;", (str(year_choice),))
 sids = [r[0] for r in cur.fetchall()]
@@ -549,7 +487,6 @@ if sids:
     rows = cur.fetchall()
 c.close()
 
-# filters
 colf1, colf2, colf3, colf4 = st.columns([1,1,1,1])
 with colf1:
     filter_player = st.selectbox("Filtrér spiller (valgfrit)", options=["- Alle -"] + [n for _,n in players])
@@ -560,7 +497,6 @@ with colf3:
 with colf4:
     fsearch = st.text_input("Søg (navne)")
 
-pid2name = {pid:name for pid,name in players}
 def match_to_row(r, perspective_pid: Optional[int]=None):
     is_d = bool(r["is_doubles"])
     s1 = [r["side1_p1"]] + ([r["side1_p2"]] if is_d and r["side1_p2"] else [])
@@ -568,16 +504,16 @@ def match_to_row(r, perspective_pid: Optional[int]=None):
     side1_names = " & ".join([pid2name.get(p,"?") for p in s1])
     side2_names = " & ".join([pid2name.get(p,"?") for p in s2])
     winner = 1 if r["score1"]>r["score2"] else 2
-    # session date
+    # date
     c = conn(); cur = c.cursor()
     cur.execute("SELECT session_date FROM sessions WHERE id=?;", (r["session_id"],))
     drow = cur.fetchone(); c.close()
     dstr = drow[0] if drow else ""
-    outcome = ""
-    mark = ""
+    outcome = ""; mark = ""
     if perspective_pid:
-        won = (winner==1 and perspective_pid in s1) or (winner==2 and perspective_pid in s2)
-        if (perspective_pid in s1) or (perspective_pid in s2):
+        involved = perspective_pid in s1 or perspective_pid in s2
+        if involved:
+            won = (winner==1 and perspective_pid in s1) or (winner==2 and perspective_pid in s2)
             outcome = "Vundet" if won else "Tabt"
             mark = "✅" if won else "❌"
     return {"Dato": dstr, "Type":"Doubles" if is_d else "Singles", "Side 1":side1_names, "Side 2":side2_names, "Resultat":f"{r['score1']}-{r['score2']}", "Vinkel": outcome, "Markering": mark}
@@ -656,3 +592,4 @@ if mvps:
     st.success("Aftenens MVP: " + ", ".join(pid2name.get(p,'?') for p in mvps))
 else:
     st.caption("MVP vises når der er registreret fremmøde/kampe i dag.")
+'''
