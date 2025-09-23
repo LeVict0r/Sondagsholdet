@@ -292,7 +292,7 @@ def compute_standings(year: int, sport: str) -> pd.DataFrame:
         winpct = round((w/mp)*100,1) if mp>0 else 0.0
         data.append([name, att, mp, w, l, winpct, total])
     df = pd.DataFrame(data, columns=["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"])
-df = df.sort_values(
+    df = df.sort_values(
     ["Point i alt","Sejre","Spiller"],
     ascending=[False, False, True]
 ).reset_index(drop=True)
