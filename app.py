@@ -4,6 +4,7 @@ import pandas as pd
 import random
 from datetime import date
 from typing import List, Tuple, Optional, Dict
+import os
 
 DB_PATH = "data/sondagsholdet.db"
 
@@ -24,22 +25,17 @@ def table_columns(c, table):
 
 def legacy_matches_columns(c):
     cols = table_columns(c, "matches")
-    # Legacy v4 had these columns
     needed = {"id","session_id","is_doubles","side1_p1","side1_p2","side2_p1","side2_p2","winning_side","score1","score2","created_at"}
     return needed.issubset(set(cols))
 
 def migrate_if_needed():
     os.makedirs("data", exist_ok=True)
     c = conn(); cur = c.cursor()
-    # Ensure players table exists (so PRAGMAs don't fail)
     cur.execute("CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);")
-
-    # ---- sessions: add sport column if missing ----
+    # sessions table
     sess_cols = table_columns(c, "sessions")
     if sess_cols and ("sport" not in sess_cols):
-        # Rename old table
         cur.execute("ALTER TABLE sessions RENAME TO sessions_old;")
-        # Create new sessions with sport + same IDs
         cur.execute("""
             CREATE TABLE sessions(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,15 +44,11 @@ def migrate_if_needed():
               UNIQUE(session_date, sport)
             );
         """)
-        # Copy over with sport='Pickleball' (legacy data var Pickleball)
         cur.execute("SELECT id, session_date FROM sessions_old;")
-        rows = cur.fetchall()
-        for sid, d in rows:
+        for sid, d in cur.fetchall():
             cur.execute("INSERT INTO sessions(id, session_date, sport) VALUES (?,?,?);", (sid, d, "Pickleball"))
         cur.execute("DROP TABLE sessions_old;")
         c.commit()
-
-    # Ensure sessions table exists if it didn't
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sessions(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,8 +57,6 @@ def migrate_if_needed():
           UNIQUE(session_date, sport)
         );
     """)
-
-    # ---- attendance table (legacy compatible) ----
     cur.execute("""
         CREATE TABLE IF NOT EXISTS attendance(
           session_id INTEGER NOT NULL,
@@ -76,16 +66,10 @@ def migrate_if_needed():
           FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
         );
     """)
-
-    # ---- matches: migrate legacy v4 to new schema (matches + match_players) ----
-    # New schema check
     new_matches_cols = table_columns(c, "matches")
     has_new_schema = set(["id","session_id","sport","team_size","score1","score2","winning_side","created_at"]).issubset(set(new_matches_cols))
-
     if not has_new_schema and legacy_matches_columns(c):
-        # Rename legacy
         cur.execute("ALTER TABLE matches RENAME TO matches_old;")
-        # Create new
         cur.execute("""
             CREATE TABLE matches(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,15 +93,12 @@ def migrate_if_needed():
               FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
             );
         """)
-        # Read from old and insert
         cur.execute("SELECT id, session_id, is_doubles, side1_p1, side1_p2, side2_p1, side2_p2, winning_side, score1, score2, created_at FROM matches_old;")
-        rows = cur.fetchall()
-        for (mid, sid, is_d, a1,a2,b1,b2, wside, sc1, sc2, created) in rows:
+        for (mid, sid, is_d, a1,a2,b1,b2, wside, sc1, sc2, created) in cur.fetchall():
             team_size = 2 if is_d==1 else 1
             sport = "Pickleball"
             cur.execute("INSERT INTO matches(id, session_id, sport, team_size, score1, score2, winning_side, created_at) VALUES (?,?,?,?,?,?,?,?);",
                         (mid, sid, sport, team_size, sc1, sc2, wside, created))
-            # match_players
             side1 = [a1] + ([a2] if a2 else [])
             side2 = [b1] + ([b2] if b2 else [])
             for p in side1:
@@ -127,7 +108,6 @@ def migrate_if_needed():
         cur.execute("DROP TABLE matches_old;")
         c.commit()
     else:
-        # Ensure new schema exists
         cur.execute("""
             CREATE TABLE IF NOT EXISTS matches(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +131,6 @@ def migrate_if_needed():
               FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
             );
         """)
-
     c.commit(); c.close()
 
 def get_or_create_session(d: date, sport: str) -> int:
@@ -160,7 +139,14 @@ def get_or_create_session(d: date, sport: str) -> int:
     cur.execute("INSERT OR IGNORE INTO sessions(session_date, sport) VALUES (?,?);", (ds, sport))
     c.commit()
     cur.execute("SELECT id FROM sessions WHERE session_date=? AND sport=?;", (ds, sport))
-    sid = cur.fetchone()[0]
+    sid_row = cur.fetchone()
+    if not sid_row:
+        # fallback create explicitly
+        cur.execute("INSERT INTO sessions(session_date, sport) VALUES (?,?);", (ds, sport))
+        c.commit()
+        cur.execute("SELECT id FROM sessions WHERE session_date=? AND sport=?;", (ds, sport))
+        sid_row = cur.fetchone()
+    sid = sid_row[0]
     c.close()
     return sid
 
@@ -210,7 +196,7 @@ def reset_all():
     DROP TABLE IF EXISTS players;
     """)
     c.commit(); c.close()
-    migrate_if_needed()  # recreate
+    migrate_if_needed()
 
 # -------------- Duplicate guard --------------
 def canonical_side(players: List[int]) -> Tuple[int,...]:
@@ -292,20 +278,16 @@ def compute_standings(year: int, sport: str) -> pd.DataFrame:
         winpct = round((w/mp)*100,1) if mp>0 else 0.0
         data.append([name, att, mp, w, l, winpct, total])
     df = pd.DataFrame(data, columns=["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"])
-    df = df.sort_values(
-    ["Point i alt","Sejre","Spiller"],
-    ascending=[False, False, True]
-).reset_index(drop=True)
-
-# Tilføj en kolonne med placering der starter ved 1
+    df = df.sort_values(["Point i alt","Sejre","Spiller"], ascending=[False,False,True]).reset_index(drop=True)
+    # Placering starter ved 1
     df.index = df.index + 1
     df.index.name = "Placering"
+    c.close(); return df
 
 # -------------- Round generator --------------
 def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode: str) -> List[Dict]:
     if not att_ids or courts<=0 or team_size<=0: return []
     ids = att_ids[:]
-
     c = conn(); cur = c.cursor()
     q = "SELECT id,name FROM players WHERE id IN (%s)" % ",".join("?"*len(ids))
     cur.execute(q, ids)
@@ -315,12 +297,11 @@ def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode
         ids.sort(key=lambda p: names.get(p,"").lower())
     else:
         random.shuffle(ids)
-
     per_match = 2*team_size
     max_matches = min(len(ids)//per_match, courts)
     matches = []
     used = 0
-    for m in range(max_matches):
+    for _ in range(max_matches):
         chunk = ids[used:used+per_match]
         used += per_match
         side1 = chunk[:team_size]
@@ -426,11 +407,13 @@ def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: in
         st.caption("Ingen kampe endnu for det valgte år.")
     # League
     st.subheader("Liga")
-    df = compute_standings(year_choice, sport)
-    if not df.empty:
-        out = df[["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"]]
-        st.dataframe(out, use_container_width=True)
-        st.download_button("Download liga (CSV)", data=out.to_csv(index=False).encode("utf-8"), file_name=f"{sport.lower()}_liga_{year_choice}.csv", mime="text/csv")
+    try:
+        liga_df = compute_standings(year_choice, sport)
+    except Exception:
+        liga_df = pd.DataFrame()
+    if isinstance(liga_df, pd.DataFrame) and not liga_df.empty:
+        st.dataframe(liga_df, use_container_width=True)
+        st.download_button("Download liga (CSV)", data=liga_df.to_csv().encode("utf-8"), file_name=f"{sport.lower()}_liga_{year_choice}.csv", mime="text/csv")
     else:
         st.caption("Ingen data i ligaen endnu.")
 
@@ -438,7 +421,6 @@ def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: in
 st.set_page_config(page_title="Søndagsholdet F/S", layout="wide")
 st.title("Søndagsholdet F/S")
 
-import os
 os.makedirs("data", exist_ok=True)
 migrate_if_needed()
 
@@ -454,7 +436,6 @@ with st.sidebar:
     if os.path.exists(DB_PATH):
         with open(DB_PATH, "rb") as f:
             st.download_button("Download database (.db)", data=f.read(), file_name="sondagsholdet.db")
-    # CSV export (all matches)
     c = conn()
     try:
         df_all = pd.read_sql_query("""
@@ -473,10 +454,9 @@ with st.sidebar:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.getbuffer())
         st.success("Database gendannet. Genindlæs siden.")
-    # Ryd data
     with st.expander("Ryd data"):
         st.caption("Slet testdata under udvikling.")
-        del_sport = st.selectbox("Sport", ["Pickleball","Badminton","Volleyball","Ffodbold","Hockey"], key="del_sport")
+        del_sport = st.selectbox("Sport", ["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"], key="del_sport")
         del_date = st.date_input("Dato", value=date.today(), key="del_date")
         if st.button("Ryd dagens data for valgt sport"):
             c = conn(); cur = c.cursor()
@@ -492,7 +472,7 @@ with st.sidebar:
             reset_all()
             st.success("Alt er ryddet.")
 
-tabs = st.tabs(["Pickleball","Badminton","Volleyball","Fodbold","Hockey"])
+tabs = st.tabs(["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"])
 
 with tabs[0]:
     sport_tab_ui("Pickleball", default_team_size=2, team_min=1, team_max=2)
@@ -501,6 +481,6 @@ with tabs[1]:
 with tabs[2]:
     sport_tab_ui("Volleyball", default_team_size=6, team_min=2, team_max=6)
 with tabs[3]:
-    sport_tab_ui("Fodbold", default_team_size=5, team_min=3, team_max=6)
+    sport_tab_ui("Indørs fodbold", default_team_size=5, team_min=3, team_max=6)
 with tabs[4]:
-    sport_tab_ui("Hockey", default_team_size=3, team_min=2, team_max=5)
+    sport_tab_ui("Indørs hockey", default_team_size=3, team_min=2, team_max=5)
