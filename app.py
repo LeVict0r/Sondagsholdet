@@ -7,55 +7,151 @@ from typing import List, Tuple, Optional, Dict
 
 DB_PATH = "data/sondagsholdet.db"
 
-# -------------- DB --------------
+# -------------- DB + Migration --------------
 def conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("PRAGMA foreign_keys = ON;")
     return c
 
-def init_db():
+def table_columns(c, table):
+    cur = c.cursor()
+    try:
+        cur.execute(f"PRAGMA table_info({table});")
+        cols = [r[1] for r in cur.fetchall()]
+        return cols
+    except sqlite3.OperationalError:
+        return []
+
+def legacy_matches_columns(c):
+    cols = table_columns(c, "matches")
+    # Legacy v4 had these columns
+    needed = {"id","session_id","is_doubles","side1_p1","side1_p2","side2_p1","side2_p2","winning_side","score1","score2","created_at"}
+    return needed.issubset(set(cols))
+
+def migrate_if_needed():
+    os.makedirs("data", exist_ok=True)
     c = conn(); cur = c.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS players(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL
-    );
-    /* Sessions are now per sport + date */
-    CREATE TABLE IF NOT EXISTS sessions(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_date TEXT NOT NULL,
-      sport TEXT NOT NULL,
-      UNIQUE(session_date, sport)
-    );
-    CREATE TABLE IF NOT EXISTS attendance(
-      session_id INTEGER NOT NULL,
-      player_id INTEGER NOT NULL,
-      PRIMARY KEY(session_id, player_id),
-      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-      FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
-    );
-    /* Matches include is_doubles concept generalized by team_size; we still keep side2 columns for up to 6, but store only p1..p6 via a JSON? Keep simple: store up to 6 per side in a separate table.
-       To stay simple and compatible, we keep 2 slots per side and encode larger teams as rows in a new table match_players. */
-    CREATE TABLE IF NOT EXISTS matches(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id INTEGER NOT NULL,
-      sport TEXT NOT NULL,
-      team_size INTEGER NOT NULL,
-      score1 INTEGER,
-      score2 INTEGER,
-      winning_side INTEGER NOT NULL, -- 1 or 2
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS match_players(
-      match_id INTEGER NOT NULL,
-      side INTEGER NOT NULL, -- 1 or 2
-      player_id INTEGER NOT NULL,
-      PRIMARY KEY(match_id, side, player_id),
-      FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE CASCADE,
-      FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
-    );
+    # Ensure players table exists (so PRAGMAs don't fail)
+    cur.execute("CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);")
+
+    # ---- sessions: add sport column if missing ----
+    sess_cols = table_columns(c, "sessions")
+    if sess_cols and ("sport" not in sess_cols):
+        # Rename old table
+        cur.execute("ALTER TABLE sessions RENAME TO sessions_old;")
+        # Create new sessions with sport + same IDs
+        cur.execute("""
+            CREATE TABLE sessions(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_date TEXT NOT NULL,
+              sport TEXT NOT NULL,
+              UNIQUE(session_date, sport)
+            );
+        """)
+        # Copy over with sport='Pickleball' (legacy data var Pickleball)
+        cur.execute("SELECT id, session_date FROM sessions_old;")
+        rows = cur.fetchall()
+        for sid, d in rows:
+            cur.execute("INSERT INTO sessions(id, session_date, sport) VALUES (?,?,?);", (sid, d, "Pickleball"))
+        cur.execute("DROP TABLE sessions_old;")
+        c.commit()
+
+    # Ensure sessions table exists if it didn't
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_date TEXT NOT NULL,
+          sport TEXT NOT NULL,
+          UNIQUE(session_date, sport)
+        );
     """)
+
+    # ---- attendance table (legacy compatible) ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS attendance(
+          session_id INTEGER NOT NULL,
+          player_id INTEGER NOT NULL,
+          PRIMARY KEY(session_id, player_id),
+          FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+          FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+        );
+    """)
+
+    # ---- matches: migrate legacy v4 to new schema (matches + match_players) ----
+    # New schema check
+    new_matches_cols = table_columns(c, "matches")
+    has_new_schema = set(["id","session_id","sport","team_size","score1","score2","winning_side","created_at"]).issubset(set(new_matches_cols))
+
+    if not has_new_schema and legacy_matches_columns(c):
+        # Rename legacy
+        cur.execute("ALTER TABLE matches RENAME TO matches_old;")
+        # Create new
+        cur.execute("""
+            CREATE TABLE matches(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id INTEGER NOT NULL,
+              sport TEXT NOT NULL,
+              team_size INTEGER NOT NULL,
+              score1 INTEGER,
+              score2 INTEGER,
+              winning_side INTEGER NOT NULL,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS match_players(
+              match_id INTEGER NOT NULL,
+              side INTEGER NOT NULL,
+              player_id INTEGER NOT NULL,
+              PRIMARY KEY(match_id, side, player_id),
+              FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE CASCADE,
+              FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+            );
+        """)
+        # Read from old and insert
+        cur.execute("SELECT id, session_id, is_doubles, side1_p1, side1_p2, side2_p1, side2_p2, winning_side, score1, score2, created_at FROM matches_old;")
+        rows = cur.fetchall()
+        for (mid, sid, is_d, a1,a2,b1,b2, wside, sc1, sc2, created) in rows:
+            team_size = 2 if is_d==1 else 1
+            sport = "Pickleball"
+            cur.execute("INSERT INTO matches(id, session_id, sport, team_size, score1, score2, winning_side, created_at) VALUES (?,?,?,?,?,?,?,?);",
+                        (mid, sid, sport, team_size, sc1, sc2, wside, created))
+            # match_players
+            side1 = [a1] + ([a2] if a2 else [])
+            side2 = [b1] + ([b2] if b2 else [])
+            for p in side1:
+                cur.execute("INSERT OR IGNORE INTO match_players(match_id, side, player_id) VALUES (?,?,?)", (mid,1,p))
+            for p in side2:
+                cur.execute("INSERT OR IGNORE INTO match_players(match_id, side, player_id) VALUES (?,?,?)", (mid,2,p))
+        cur.execute("DROP TABLE matches_old;")
+        c.commit()
+    else:
+        # Ensure new schema exists
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS matches(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id INTEGER NOT NULL,
+              sport TEXT NOT NULL,
+              team_size INTEGER NOT NULL,
+              score1 INTEGER,
+              score2 INTEGER,
+              winning_side INTEGER NOT NULL,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS match_players(
+              match_id INTEGER NOT NULL,
+              side INTEGER NOT NULL,
+              player_id INTEGER NOT NULL,
+              PRIMARY KEY(match_id, side, player_id),
+              FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE CASCADE,
+              FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+            );
+        """)
+
     c.commit(); c.close()
 
 def get_or_create_session(d: date, sport: str) -> int:
@@ -98,7 +194,6 @@ def list_attendance(session_id: int) -> List[int]:
 
 def delete_session_data(session_id: int):
     c = conn(); cur = c.cursor()
-    # delete matches (and their players) then attendance and session
     cur.execute("DELETE FROM match_players WHERE match_id IN (SELECT id FROM matches WHERE session_id=?);", (session_id,))
     cur.execute("DELETE FROM matches WHERE session_id=?;", (session_id,))
     cur.execute("DELETE FROM attendance WHERE session_id=?;", (session_id,))
@@ -115,9 +210,9 @@ def reset_all():
     DROP TABLE IF EXISTS players;
     """)
     c.commit(); c.close()
-    init_db()
+    migrate_if_needed()  # recreate
 
-# -------------- Match saving + duplicate guard --------------
+# -------------- Duplicate guard --------------
 def canonical_side(players: List[int]) -> Tuple[int,...]:
     return tuple(sorted(players))
 
@@ -139,7 +234,6 @@ def match_duplicate_exists(session_id: int, sport: str, team_size: int, side1: L
     by_match = {}
     for r in rows:
         by_match.setdefault(r["match_id"], {1:[],2:[]})[r["side"]].append(r["player_id"])
-    # compare
     for m in mats:
         mp = by_match.get(m["id"], {1:[],2:[]})
         a = canonical_side(mp.get(1,[])); b = canonical_side(mp.get(2,[]))
@@ -177,15 +271,12 @@ def compute_standings(year: int, sport: str) -> pd.DataFrame:
     if not sids:
         c.close(); return pd.DataFrame()
     sid_tuple = "(" + ",".join("?"*len(sids)) + ")"
-    # Fremmøde
     cur.execute(f"SELECT player_id, COUNT(*) FROM attendance WHERE session_id IN {sid_tuple} GROUP BY player_id;", sids)
     attendance = dict(cur.fetchall())
-    # Sejre/nederlag fra matches
-    cur.execute(f"SELECT id, winning_side, session_id FROM matches WHERE session_id IN {sid_tuple};", sids)
+    cur.execute(f"SELECT id, winning_side FROM matches WHERE session_id IN {sid_tuple};", sids)
     rows = cur.fetchall()
     wins = {pid:0 for pid in players}; losses = {pid:0 for pid in players}; played = {pid:0 for pid in players}
-    for mid, wside, sid in rows:
-        # read participants
+    for (mid, wside) in rows:
         cur.execute("SELECT side, player_id FROM match_players WHERE match_id=?;", (mid,))
         parts = cur.fetchall()
         s1 = [p[1] for p in parts if p[0]==1]; s2 = [p[1] for p in parts if p[0]==2]
@@ -199,22 +290,16 @@ def compute_standings(year: int, sport: str) -> pd.DataFrame:
         att = attendance.get(pid,0); mp=played.get(pid,0); w=wins.get(pid,0); l=losses.get(pid,0)
         total = att*1 + w*3
         winpct = round((w/mp)*100,1) if mp>0 else 0.0
-        data.append([name, att, mp, w, l, winpct, total, pid])
-    df = pd.DataFrame(data, columns=["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt","pid"])
+        data.append([name, att, mp, w, l, winpct, total])
+    df = pd.DataFrame(data, columns=["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"])
     df = df.sort_values(["Point i alt","Sejre","Spiller"], ascending=[False,False,True]).reset_index(drop=True)
     c.close(); return df
 
-# -------------- Round generator (general team size) --------------
+# -------------- Round generator --------------
 def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode: str) -> List[Dict]:
-    """
-    Make as many matches for current round as courts allow.
-    Each match needs 2*team_size unique players.
-    Returns list of dicts: {side1: [pids], side2: [pids]}
-    """
     if not att_ids or courts<=0 or team_size<=0: return []
     ids = att_ids[:]
 
-    # Ordering / mixing
     c = conn(); cur = c.cursor()
     q = "SELECT id,name FROM players WHERE id IN (%s)" % ",".join("?"*len(ids))
     cur.execute(q, ids)
@@ -237,7 +322,7 @@ def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode
         matches.append({"side1": side1, "side2": side2})
     return matches
 
-# -------------- UI Shared --------------
+# -------------- UI Per sport --------------
 def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: int):
     st.header(sport)
     col1, col2, col3 = st.columns([1,1,1])
@@ -247,7 +332,7 @@ def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: in
     with col2:
         team_size = st.number_input("Holdstørrelse", min_value=team_min, max_value=team_max, value=default_team_size, step=1, key=f"teamsize_{sport}")
     with col3:
-        courts = st.number_input("Antal baner/baner", min_value=1, max_value=8, value=2, step=1, key=f"courts_{sport}")
+        courts = st.number_input("Baner", min_value=1, max_value=8, value=2, step=1, key=f"courts_{sport}")
     # Attendance
     players = list_players()
     pid2name = {pid:name for pid,name in players}
@@ -284,8 +369,10 @@ def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: in
             with c1:
                 st.write(f"{s1_names}  vs  {s2_names}")
             with c2:
-                sc1 = st.number_input(f"Score {s1_names}", min_value=0, max_value=50, value=21 if sport=='Badminton' else 11, step=1, key=f"sc1_{sport}_{idx}")
-                sc2 = st.number_input(f"Score {s2_names}", min_value=0, max_value=50, value=19 if sport=='Badminton' else 7, step=1, key=f"sc2_{sport}_{idx}")
+                default1 = 21 if sport=='Badminton' else 11
+                default2 = 19 if sport=='Badminton' else 7
+                sc1 = st.number_input(f"Score {s1_names}", min_value=0, max_value=50, value=default1, step=1, key=f"sc1_{sport}_{idx}")
+                sc2 = st.number_input(f"Score {s2_names}", min_value=0, max_value=50, value=default2, step=1, key=f"sc2_{sport}_{idx}")
             with c3:
                 if st.button("Gem resultat", key=f"save_{sport}_{idx}"):
                     if sc1 == sc2:
@@ -320,7 +407,6 @@ def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: in
     for mid, sc1, sc2, wside, s1, s2 in rows:
         s1_names = " & ".join(pid2name.get(p,"?") for p in s1)
         s2_names = " & ".join(pid2name.get(p,"?") for p in s2)
-        # find date
         c = conn(); cur = c.cursor()
         cur.execute("SELECT session_date FROM sessions WHERE id=(SELECT session_id FROM matches WHERE id=?);", (mid,))
         drow = cur.fetchone(); c.close()
@@ -348,7 +434,7 @@ st.title("Søndagsholdet F/S")
 
 import os
 os.makedirs("data", exist_ok=True)
-init_db()
+migrate_if_needed()
 
 with st.sidebar:
     st.header("Indstillinger")
@@ -381,10 +467,9 @@ with st.sidebar:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.getbuffer())
         st.success("Database gendannet. Genindlæs siden.")
-    # Dangerous ops
+    # Ryd data
     with st.expander("Ryd data"):
         st.caption("Slet testdata under udvikling.")
-        # select sport and date to delete
         del_sport = st.selectbox("Sport", ["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"], key="del_sport")
         del_date = st.date_input("Dato", value=date.today(), key="del_date")
         if st.button("Ryd dagens data for valgt sport"):
@@ -404,17 +489,12 @@ with st.sidebar:
 tabs = st.tabs(["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"])
 
 with tabs[0]:
-    # Pickleball: vælg 1v1 eller 2v2
     sport_tab_ui("Pickleball", default_team_size=2, team_min=1, team_max=2)
 with tabs[1]:
-    # Badminton: 1v1 eller 2v2; default 2
     sport_tab_ui("Badminton", default_team_size=2, team_min=1, team_max=2)
 with tabs[2]:
-    # Volleyball: typisk 6v6 men kan skaleres
     sport_tab_ui("Volleyball", default_team_size=6, team_min=2, team_max=6)
 with tabs[3]:
-    # Indørs fodbold: typisk 5v5, kan 3-6
     sport_tab_ui("Indørs fodbold", default_team_size=5, team_min=3, team_max=6)
 with tabs[4]:
-    # Indørs hockey: typisk 3v3, kan 2-5
     sport_tab_ui("Indørs hockey", default_team_size=3, team_min=2, team_max=5)
