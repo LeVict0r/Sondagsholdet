@@ -292,8 +292,14 @@ def compute_standings(year: int, sport: str) -> pd.DataFrame:
         winpct = round((w/mp)*100,1) if mp>0 else 0.0
         data.append([name, att, mp, w, l, winpct, total])
     df = pd.DataFrame(data, columns=["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"])
-    df = df.sort_values(["Point i alt","Sejre","Spiller"], ascending=[False,False,True]).reset_index(drop=True)
-    c.close(); return df
+df = df.sort_values(
+    ["Point i alt","Sejre","Spiller"],
+    ascending=[False, False, True]
+).reset_index(drop=True)
+
+# Tilføj en kolonne med placering der starter ved 1
+df.index = df.index + 1
+df.index.name = "Placering"
 
 # -------------- Round generator --------------
 def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode: str) -> List[Dict]:
