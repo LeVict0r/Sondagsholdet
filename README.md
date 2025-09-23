@@ -1,19 +1,21 @@
 
-# Søndagsholdet F/S – Onepager v2
+# Søndagsholdet F/S – v4 (clean, singles-logik, backups)
 
-Nyt i v2:
-- **Antal baner** (1–6) styrer rundeplanen.
-- **Ulige fremmøde** → automatisk *sidde-over rotation* (fair og uden gentagelser).
-- **Remix pr. runde** af makkerpar (undgår sidste runde-partnere hvis muligt).
-- **Singles-slot (valgfrit)** når spillerantal = `4k+2` **og** baner ≥ 3 (to single-spillere får kamp i runden).
-- **Per-runde visning**: opret runde → registrér vindere → runden lukker automatisk, lav ny runde.
-- Live-liga & Rival som før. Kamp-arkiv som før.
+**Hvad den kan:**
+- Fremmøde → 1 point pr. spiller pr. dato
+- Start spil → genererer runde ud fra antal baner
+  - Optimerer: vælger antal doubles og singles for at få flest mulige spillere i spil
+  - Eksempel: 6 spillere + 2 baner → 1 doubles + 1 singles (alle spiller)
+  - Eksempel: 10 spillere + 3 baner → 2 doubles + 1 singles (alle 10 spiller)
+- Gem resultater efter kamp (ikke undervejs)
+- Kamp-arkiv (filtrérbart) + CSV-download
+- Liga med Rival-badge (tættest på 50/50 H2H)
+- Backup i sidebaren: Download `.db`, Download kampe (CSV), Upload `.db`
 
-## Kør
-
+**Kør:**
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Data ligger i `data/sondagsholdet.db`.
+Data gemmes i `data/sondagsholdet.db`.
