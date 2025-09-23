@@ -1,14 +1,13 @@
-
 import streamlit as st
 import sqlite3
 import pandas as pd
 import random
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import List, Tuple, Optional, Dict
 
 DB_PATH = "data/sondagsholdet.db"
 
-# ---------------- DB ----------------
+# -------------- DB --------------
 def conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("PRAGMA foreign_keys = ON;")
@@ -21,9 +20,12 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL
     );
+    /* Sessions are now per sport + date */
     CREATE TABLE IF NOT EXISTS sessions(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_date TEXT NOT NULL UNIQUE
+      session_date TEXT NOT NULL,
+      sport TEXT NOT NULL,
+      UNIQUE(session_date, sport)
     );
     CREATE TABLE IF NOT EXISTS attendance(
       session_id INTEGER NOT NULL,
@@ -32,39 +34,46 @@ def init_db():
       FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
       FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
     );
+    /* Matches include is_doubles concept generalized by team_size; we still keep side2 columns for up to 6, but store only p1..p6 via a JSON? Keep simple: store up to 6 per side in a separate table.
+       To stay simple and compatible, we keep 2 slots per side and encode larger teams as rows in a new table match_players. */
     CREATE TABLE IF NOT EXISTS matches(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id INTEGER NOT NULL,
-      is_doubles INTEGER NOT NULL,
-      side1_p1 INTEGER NOT NULL,
-      side1_p2 INTEGER,
-      side2_p1 INTEGER NOT NULL,
-      side2_p2 INTEGER,
-      winning_side INTEGER NOT NULL,
+      sport TEXT NOT NULL,
+      team_size INTEGER NOT NULL,
       score1 INTEGER,
       score2 INTEGER,
+      winning_side INTEGER NOT NULL, -- 1 or 2
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS match_players(
+      match_id INTEGER NOT NULL,
+      side INTEGER NOT NULL, -- 1 or 2
+      player_id INTEGER NOT NULL,
+      PRIMARY KEY(match_id, side, player_id),
+      FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE CASCADE,
+      FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
     );
     """)
     c.commit(); c.close()
 
-def get_or_create_session(d: date) -> int:
+def get_or_create_session(d: date, sport: str) -> int:
     c = conn(); cur = c.cursor()
     ds = d.isoformat()
-    cur.execute("INSERT OR IGNORE INTO sessions(session_date) VALUES (?);", (ds,))
+    cur.execute("INSERT OR IGNORE INTO sessions(session_date, sport) VALUES (?,?);", (ds, sport))
     c.commit()
-    cur.execute("SELECT id FROM sessions WHERE session_date=?;", (ds,))
+    cur.execute("SELECT id FROM sessions WHERE session_date=? AND sport=?;", (ds, sport))
     sid = cur.fetchone()[0]
     c.close()
     return sid
 
-def list_players() -> List[Tuple[int,str]]:
+def list_players():
     c = conn(); cur = c.cursor()
     cur.execute("SELECT id,name FROM players ORDER BY name COLLATE NOCASE;")
     rows = cur.fetchall(); c.close(); return rows
 
-def add_player(name: str) -> Optional[int]:
+def add_player(name: str):
     name = (name or '').strip()
     if not name: return None
     c = conn(); cur = c.cursor()
@@ -88,17 +97,18 @@ def list_attendance(session_id: int) -> List[int]:
     c.close(); return rows
 
 def delete_session_data(session_id: int):
-    """Delete matches + attendance + the session row (safe cleanup of 'dagens data')."""
     c = conn(); cur = c.cursor()
+    # delete matches (and their players) then attendance and session
+    cur.execute("DELETE FROM match_players WHERE match_id IN (SELECT id FROM matches WHERE session_id=?);", (session_id,))
     cur.execute("DELETE FROM matches WHERE session_id=?;", (session_id,))
     cur.execute("DELETE FROM attendance WHERE session_id=?;", (session_id,))
     cur.execute("DELETE FROM sessions WHERE id=?;", (session_id,))
     c.commit(); c.close()
 
 def reset_all():
-    """Drop everything (hard reset)."""
     c = conn(); cur = c.cursor()
     cur.executescript("""
+    DROP TABLE IF EXISTS match_players;
     DROP TABLE IF EXISTS matches;
     DROP TABLE IF EXISTS attendance;
     DROP TABLE IF EXISTS sessions;
@@ -107,76 +117,78 @@ def reset_all():
     c.commit(); c.close()
     init_db()
 
-def normalize_side_tuple(is_doubles: int, side: Tuple[int, Optional[int]]) -> Tuple[int, Optional[int]]:
-    """Return side as sorted (p1<=p2) tuple for robust comparison (order independent)."""
-    p = [side[0]] + ([side[1]] if side[1] else [])
-    p = sorted([x for x in p if x is not None])
-    if is_doubles:
-        return (p[0], p[1])
-    else:
-        return (p[0], None)
+# -------------- Match saving + duplicate guard --------------
+def canonical_side(players: List[int]) -> Tuple[int,...]:
+    return tuple(sorted(players))
 
-def match_exists(session_id: int, is_doubles: int, side1: Tuple[int, Optional[int]], side2: Tuple[int, Optional[int]], score1: int, score2: int) -> bool:
-    """
-    Prevent saving same match repeatedly.
-    Rule: within the same session, if there already exists a match with the SAME unordered participants and the SAME score (either 11-7 or 7-11 etc.), it's a duplicate.
-    """
-    s1 = normalize_side_tuple(is_doubles, side1)
-    s2 = normalize_side_tuple(is_doubles, side2)
-    # create canonical order: smaller first by tuple
+def match_duplicate_exists(session_id: int, sport: str, team_size: int, side1: List[int], side2: List[int], score1: int, score2: int) -> bool:
+    s1 = canonical_side(side1); s2 = canonical_side(side2)
     if s2 < s1:
         s1, s2 = s2, s1
-        score1, score2 = score2, score1  # align score with sides flip
+        score1, score2 = score2, score1
     c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
-    cur.execute("""
-        SELECT side1_p1, side1_p2, side2_p1, side2_p2, score1, score2
-        FROM matches
-        WHERE session_id=? AND is_doubles=?
-    """, (session_id, is_doubles))
+    cur.execute("SELECT id, score1, score2 FROM matches WHERE session_id=? AND sport=? AND team_size=?;", (session_id, sport, team_size))
+    mats = cur.fetchall()
+    if not mats:
+        c.close(); return False
+    ids = [m["id"] for m in mats]
+    ph = ",".join("?"*len(ids))
+    cur.execute(f"SELECT match_id, side, player_id FROM match_players WHERE match_id IN ({ph})", ids)
     rows = cur.fetchall()
     c.close()
+    by_match = {}
     for r in rows:
-        a = normalize_side_tuple(is_doubles, (r["side1_p1"], r["side1_p2"]))
-        b = normalize_side_tuple(is_doubles, (r["side2_p1"], r["side2_p2"]))
-        ra, rb = (a, b) if a <= b else (b, a)
-        # flip score accordingly
-        rsc1, rsc2 = (r["score1"], r["score2"]) if (a, b)==(ra, rb) else (r["score2"], r["score1"])
-        if ra == s1 and rb == s2 and rsc1 == score1 and rsc2 == score2:
+        by_match.setdefault(r["match_id"], {1:[],2:[]})[r["side"]].append(r["player_id"])
+    # compare
+    for m in mats:
+        mp = by_match.get(m["id"], {1:[],2:[]})
+        a = canonical_side(mp.get(1,[])); b = canonical_side(mp.get(2,[]))
+        ra, rb = (a,b) if a<=b else (b,a)
+        rsc1, rsc2 = (m["score1"], m["score2"]) if (a,b)==(ra,rb) else (m["score2"], m["score1"])
+        if ra==s1 and rb==s2 and rsc1==score1 and rsc2==score2:
             return True
     return False
 
-def save_match(session_id: int, is_doubles: int, side1: Tuple[int, Optional[int]], side2: Tuple[int, Optional[int]], winner: int, score1: int, score2: int) -> bool:
-    """Returns True if saved, False if rejected by duplicate guard."""
-    if match_exists(session_id, is_doubles, side1, side2, score1, score2):
+def save_match(session_id: int, sport: str, team_size: int, side1: List[int], side2: List[int], score1: int, score2: int) -> bool:
+    if match_duplicate_exists(session_id, sport, team_size, side1, side2, score1, score2):
         return False
+    winner = 1 if score1>score2 else 2
     c = conn(); cur = c.cursor()
     cur.execute("""
-        INSERT INTO matches(session_id, is_doubles, side1_p1, side1_p2, side2_p1, side2_p2, winning_side, score1, score2)
-        VALUES (?,?,?,?,?,?,?,?,?);
-    """, (session_id, is_doubles, side1[0], side1[1], side2[0], side2[1], winner, score1, score2))
+        INSERT INTO matches(session_id, sport, team_size, score1, score2, winning_side) VALUES (?,?,?,?,?,?);
+    """, (session_id, sport, team_size, score1, score2, winner))
+    mid = cur.lastrowid
+    for pid in side1:
+        cur.execute("INSERT INTO match_players(match_id, side, player_id) VALUES (?,?,?)", (mid,1,pid))
+    for pid in side2:
+        cur.execute("INSERT INTO match_players(match_id, side, player_id) VALUES (?,?,?)", (mid,2,pid))
     c.commit(); c.close()
     return True
 
-# ---------------- Stats ----------------
-def compute_standings(year: int) -> pd.DataFrame:
+# -------------- Stats --------------
+def compute_standings(year: int, sport: str) -> pd.DataFrame:
     c = conn(); cur = c.cursor()
     cur.execute("SELECT id,name FROM players;")
     players = dict(cur.fetchall())
     if not players:
         c.close(); return pd.DataFrame()
-    cur.execute("SELECT id FROM sessions WHERE strftime('%Y', session_date)=?;", (str(year),))
+    cur.execute("SELECT id FROM sessions WHERE strftime('%Y', session_date)=? AND sport=?;", (str(year), sport))
     sids = [r[0] for r in cur.fetchall()]
     if not sids:
         c.close(); return pd.DataFrame()
     sid_tuple = "(" + ",".join("?"*len(sids)) + ")"
+    # Fremmøde
     cur.execute(f"SELECT player_id, COUNT(*) FROM attendance WHERE session_id IN {sid_tuple} GROUP BY player_id;", sids)
     attendance = dict(cur.fetchall())
-    cur.execute(f"SELECT is_doubles, side1_p1, side1_p2, side2_p1, side2_p2, winning_side FROM matches WHERE session_id IN {sid_tuple};", sids)
+    # Sejre/nederlag fra matches
+    cur.execute(f"SELECT id, winning_side, session_id FROM matches WHERE session_id IN {sid_tuple};", sids)
     rows = cur.fetchall()
     wins = {pid:0 for pid in players}; losses = {pid:0 for pid in players}; played = {pid:0 for pid in players}
-    for is_d, s1p1, s1p2, s2p1, s2p2, wside in rows:
-        s1 = [s1p1] + ([s1p2] if s1p2 else [])
-        s2 = [s2p1] + ([s2p2] if s2p2 else [])
+    for mid, wside, sid in rows:
+        # read participants
+        cur.execute("SELECT side, player_id FROM match_players WHERE match_id=?;", (mid,))
+        parts = cur.fetchall()
+        s1 = [p[1] for p in parts if p[0]==1]; s2 = [p[1] for p in parts if p[0]==2]
         for p in s1+s2: played[p]=played.get(p,0)+1
         winners = s1 if wside==1 else s2
         losers  = s2 if wside==1 else s1
@@ -192,53 +204,17 @@ def compute_standings(year: int) -> pd.DataFrame:
     df = df.sort_values(["Point i alt","Sejre","Spiller"], ascending=[False,False,True]).reset_index(drop=True)
     c.close(); return df
 
-def compute_rivals(year: int) -> Dict[int, Dict]:
-    c = conn(); cur = c.cursor()
-    cur.execute("SELECT id,name FROM players;"); players = dict(cur.fetchall())
-    result = {pid: None for pid in players}
-    if not players: c.close(); return result
-    cur.execute("SELECT id FROM sessions WHERE strftime('%Y', session_date)=?;", (str(year),))
-    sids=[r[0] for r in cur.fetchall()]
-    if not sids: c.close(); return result
-    sid_tuple = "(" + ",".join("?"*len(sids)) + ")"
-    cur.execute(f"SELECT is_doubles, side1_p1, side1_p2, side2_p1, side2_p2, winning_side FROM matches WHERE session_id IN {sid_tuple};", sids)
-    rows = cur.fetchall()
-    h2h = {pid:{} for pid in players}
-    for is_d, a1,a2,b1,b2,wside in rows:
-        s1 = [a1] + ([a2] if a2 else [])
-        s2 = [b1] + ([b2] if b2 else [])
-        winners = set(s1 if wside==1 else s2)
-        for A in s1:
-            for B in s2:
-                h2h.setdefault(A, {}).setdefault(B, [0,0])
-                if A in winners: h2h[A][B][0]+=1
-                else: h2h[A][B][1]+=1
-        for A in s2:
-            for B in s1:
-                h2h.setdefault(A, {}).setdefault(B, [0,0])
-                if A in winners: h2h[A][B][0]+=1
-                else: h2h[A][B][1]+=1
-    for A in players:
-        candidates = []
-        for B,(w,l) in h2h.get(A,{}).items():
-            tot = w+l
-            if tot>=3:
-                wr = w/tot
-                score = abs(wr-0.5)
-                candidates.append((score, -tot, B, w, l, wr))
-        if not candidates: continue
-        candidates.sort()
-        score, neg, B, w, l, wr = candidates[0]
-        result[A] = {"opponent_id": B, "w": w, "l": l, "meetings": -neg, "winpct": round(wr*100,1)}
-    c.close(); return result
-
-# ---------------- Round generator ----------------
-def make_round_matches(att_ids: List[int], courts: int, mix_mode: str) -> List[Dict]:
-    """Maximize players on court per runde by choosing d doubles and s singles within available courts."""
-    if not att_ids or courts <= 0: return []
+# -------------- Round generator (general team size) --------------
+def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode: str) -> List[Dict]:
+    """
+    Make as many matches for current round as courts allow.
+    Each match needs 2*team_size unique players.
+    Returns list of dicts: {side1: [pids], side2: [pids]}
+    """
+    if not att_ids or courts<=0 or team_size<=0: return []
     ids = att_ids[:]
 
-    # order: Snake uses name order; Random shuffles
+    # Ordering / mixing
     c = conn(); cur = c.cursor()
     q = "SELECT id,name FROM players WHERE id IN (%s)" % ",".join("?"*len(ids))
     cur.execute(q, ids)
@@ -249,40 +225,124 @@ def make_round_matches(att_ids: List[int], courts: int, mix_mode: str) -> List[D
     else:
         random.shuffle(ids)
 
-    N = len(ids)
-    best = None  # (used_players, doubles, singles)
-    max_doubles = min(N // 4, courts)
-    for d in range(max_doubles, -1, -1):
-        rem_players = N - 4*d
-        rem_courts = courts - d
-        s = min(rem_players // 2, rem_courts)
-        used = 4*d + 2*s
-        cand = (used, d, s)
-        if best is None or used > best[0] or (used == best[0] and d > best[1]):
-            best = cand
-    used, d, s = best
-
-    doubles_players = ids[:4*d]
-    singles_players = ids[4*d:4*d+2*s]
-
+    per_match = 2*team_size
+    max_matches = min(len(ids)//per_match, courts)
     matches = []
-    # build doubles matches (pair adjacent into teams, then teams into matches)
-    teams = []
-    for i in range(0, len(doubles_players), 2):
-        teams.append( (doubles_players[i], doubles_players[i+1]) )
-    for j in range(0, len(teams), 2):
-        if j+1 < len(teams):
-            t1, t2 = teams[j], teams[j+1]
-            matches.append({"is_doubles":1, "side1":(t1[0], t1[1]), "side2":(t2[0], t2[1])})
-
-    # build singles matches
-    for k in range(0, len(singles_players), 2):
-        p1 = singles_players[k]; p2 = singles_players[k+1]
-        matches.append({"is_doubles":0, "side1":(p1, None), "side2":(p2, None)})
-
+    used = 0
+    for m in range(max_matches):
+        chunk = ids[used:used+per_match]
+        used += per_match
+        side1 = chunk[:team_size]
+        side2 = chunk[team_size:]
+        matches.append({"side1": side1, "side2": side2})
     return matches
 
-# ---------------- UI ----------------
+# -------------- UI Shared --------------
+def sport_tab_ui(sport: str, default_team_size: int, team_min: int, team_max: int):
+    st.header(sport)
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        sel_date = st.date_input("Dato", value=date.today(), key=f"date_{sport}")
+        session_id = get_or_create_session(sel_date, sport)
+    with col2:
+        team_size = st.number_input("Holdstørrelse", min_value=team_min, max_value=team_max, value=default_team_size, step=1, key=f"teamsize_{sport}")
+    with col3:
+        courts = st.number_input("Antal baner/baner", min_value=1, max_value=8, value=2, step=1, key=f"courts_{sport}")
+    # Attendance
+    players = list_players()
+    pid2name = {pid:name for pid,name in players}
+    st.subheader("Fremmøde")
+    picked = st.multiselect("Vælg spillere", [name for _,name in players], default=[pid2name.get(pid) for pid in list_attendance(session_id)], key=f"att_{sport}")
+    picked_ids = [pid for pid,name in players if name in picked]
+    if st.button("Gem fremmøde", key=f"save_att_{sport}"):
+        record_attendance(session_id, picked_ids)
+        st.success("Fremmøde gemt.")
+    # Controls
+    st.subheader("Start spil")
+    mix_mode = st.radio("Mixing", ["Random","Snake (balanceret)"], horizontal=True, key=f"mix_{sport}")
+    att_ids = list_attendance(session_id)
+    if st.button("Start runde", key=f"start_round_{sport}"):
+        if len(att_ids) < 2*team_size:
+            st.warning(f"For få spillere til {team_size}v{team_size}.")
+        else:
+            matches = make_round_matches(att_ids, int(courts), int(team_size), mix_mode)
+            if not matches:
+                st.warning("Kunne ikke planlægge kampe til denne runde.")
+            else:
+                st.session_state[f"matches_{sport}"] = matches
+                st.session_state[f"session_{sport}"] = session_id
+                st.success(f"Runde startet med {len(matches)} kampe.")
+    # Active matches
+    key_matches = f"matches_{sport}"
+    if key_matches in st.session_state and st.session_state.get(f"session_{sport}")==session_id:
+        st.subheader("Aktive kampe")
+        for idx, m in enumerate(st.session_state[key_matches], start=1):
+            s1 = m["side1"]; s2 = m["side2"]
+            s1_names = " & ".join(pid2name.get(p,"?") for p in s1)
+            s2_names = " & ".join(pid2name.get(p,"?") for p in s2)
+            c1, c2, c3 = st.columns([3,3,2])
+            with c1:
+                st.write(f"{s1_names}  vs  {s2_names}")
+            with c2:
+                sc1 = st.number_input(f"Score {s1_names}", min_value=0, max_value=50, value=21 if sport=='Badminton' else 11, step=1, key=f"sc1_{sport}_{idx}")
+                sc2 = st.number_input(f"Score {s2_names}", min_value=0, max_value=50, value=19 if sport=='Badminton' else 7, step=1, key=f"sc2_{sport}_{idx}")
+            with c3:
+                if st.button("Gem resultat", key=f"save_{sport}_{idx}"):
+                    if sc1 == sc2:
+                        st.warning("Ingen uafgjort. Justér score.")
+                    else:
+                        ok = save_match(session_id, sport, int(team_size), s1, s2, int(sc1), int(sc2))
+                        if ok:
+                            st.success("Kamp gemt.")
+                        else:
+                            st.info("Den kamp er allerede gemt (samme deltagere og score i dag).")
+    # Archive
+    st.subheader("Kamp-arkiv")
+    year_choice = st.number_input("År", min_value=2000, max_value=2100, value=date.today().year, step=1, key=f"year_{sport}")
+    c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
+    cur.execute("SELECT id FROM sessions WHERE strftime('%Y', session_date)=? AND sport=?;", (str(year_choice), sport))
+    sids = [r[0] for r in cur.fetchall()]
+    rows = []
+    if sids:
+        sid_tuple = "(" + ",".join("?"*len(sids)) + ")"
+        cur.execute(f"SELECT id, score1, score2, winning_side FROM matches WHERE session_id IN {sid_tuple} ORDER BY id DESC;", sids)
+        mats = cur.fetchall()
+        for m in mats:
+            mid = m["id"]
+            cur.execute("SELECT side, player_id FROM match_players WHERE match_id=?;", (mid,))
+            parts = cur.fetchall()
+            s1 = [p[1] for p in parts if p[0]==1]; s2 = [p[1] for p in parts if p[0]==2]
+            rows.append((mid, m["score1"], m["score2"], m["winning_side"], s1, s2))
+    c.close()
+    players = list_players()
+    pid2name = {pid:name for pid,name in players}
+    table_rows = []
+    for mid, sc1, sc2, wside, s1, s2 in rows:
+        s1_names = " & ".join(pid2name.get(p,"?") for p in s1)
+        s2_names = " & ".join(pid2name.get(p,"?") for p in s2)
+        # find date
+        c = conn(); cur = c.cursor()
+        cur.execute("SELECT session_date FROM sessions WHERE id=(SELECT session_id FROM matches WHERE id=?);", (mid,))
+        drow = cur.fetchone(); c.close()
+        dstr = drow[0] if drow else ""
+        table_rows.append({"Dato": dstr, "Side 1": s1_names, "Side 2": s2_names, "Resultat": f"{sc1}-{sc2}"})
+    if table_rows:
+        df_arch = pd.DataFrame(table_rows)
+        st.dataframe(df_arch, use_container_width=True)
+        st.download_button("Download arkiv (CSV)", data=df_arch.to_csv(index=False).encode("utf-8"), file_name=f"{sport.lower()}_arkiv_{year_choice}.csv", mime="text/csv")
+    else:
+        st.caption("Ingen kampe endnu for det valgte år.")
+    # League
+    st.subheader("Liga")
+    df = compute_standings(year_choice, sport)
+    if not df.empty:
+        out = df[["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"]]
+        st.dataframe(out, use_container_width=True)
+        st.download_button("Download liga (CSV)", data=out.to_csv(index=False).encode("utf-8"), file_name=f"{sport.lower()}_liga_{year_choice}.csv", mime="text/csv")
+    else:
+        st.caption("Ingen data i ligaen endnu.")
+
+# -------------- App UI --------------
 st.set_page_config(page_title="Søndagsholdet F/S", layout="wide")
 st.title("Søndagsholdet F/S")
 
@@ -292,207 +352,69 @@ init_db()
 
 with st.sidebar:
     st.header("Indstillinger")
-    # Add player
     with st.form("add_player_form", clear_on_submit=True):
         nm = st.text_input("Tilføj spiller")
         submitted = st.form_submit_button("Gem spiller")
         if submitted and nm.strip():
             pid = add_player(nm)
             if pid: st.success(f"Tilføjet: {nm}")
-            else: st.warning("Kunne ikke tilføje.")
     # Backups
     if os.path.exists(DB_PATH):
         with open(DB_PATH, "rb") as f:
             st.download_button("Download database (.db)", data=f.read(), file_name="sondagsholdet.db")
-    # CSV export of matches
+    # CSV export (all matches)
     c = conn()
     try:
-        df_all = pd.read_sql_query("SELECT * FROM matches", c)
+        df_all = pd.read_sql_query("""
+            SELECT m.id, s.session_date, s.sport, m.team_size, m.score1, m.score2, m.winning_side
+            FROM matches m JOIN sessions s ON s.id = m.session_id
+            ORDER BY m.id DESC
+        """, c)
     except Exception:
         df_all = pd.DataFrame()
     finally:
         c.close()
     if not df_all.empty:
-        st.download_button("Download alle kampe (CSV)", data=df_all.to_csv(index=False).encode("utf-8"), file_name="kampe.csv", mime="text/csv")
+        st.download_button("Download alle kampe (CSV)", data=df_all.to_csv(index=False).encode("utf-8"), file_name="alle_kampe.csv", mime="text/csv")
     uploaded = st.file_uploader("Upload database (.db)", type=["db"])
     if uploaded is not None:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.getbuffer())
-        st.success("Database gendannet. Genindlæs siden for at se ændringer.")
+        st.success("Database gendannet. Genindlæs siden.")
     # Dangerous ops
     with st.expander("Ryd data"):
-        st.caption("Brug disse knapper med omtanke i testfasen.")
-        if st.button("Ryd dagens data (matches + fremmøde for valgt dato)"):
-            # We'll delete the session below after we know which date is chosen.
-            st.session_state["_delete_today_requested"] = True
-        if st.button("Ryd ALT (drop hele databasen)"):
+        st.caption("Slet testdata under udvikling.")
+        # select sport and date to delete
+        del_sport = st.selectbox("Sport", ["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"], key="del_sport")
+        del_date = st.date_input("Dato", value=date.today(), key="del_date")
+        if st.button("Ryd dagens data for valgt sport"):
+            c = conn(); cur = c.cursor()
+            cur.execute("SELECT id FROM sessions WHERE session_date=? AND sport=?;", (del_date.isoformat(), del_sport))
+            row = cur.fetchone()
+            if row:
+                delete_session_data(row[0])
+                st.success("Dagens data ryddet.")
+            else:
+                st.info("Ingen session fundet for den dato/sport.")
+            c.close()
+        if st.button("Ryd ALT (drop database)"):
             reset_all()
             st.success("Alt er ryddet.")
 
-# Session & attendance
-col1, col2 = st.columns([1,1])
-with col1:
-    sel_date = st.date_input("Dato", value=date.today())
-    # If user asked to delete today's data:
-    if st.session_state.get("_delete_today_requested"):
-        # Only run once per click
-        st.session_state["_delete_today_requested"] = False
-        # Try to find session by date; if doesn't exist, just ignore
-        c = conn(); cur = c.cursor()
-        cur.execute("SELECT id FROM sessions WHERE session_date=?;", (sel_date.isoformat(),))
-        row = cur.fetchone()
-        if row:
-            delete_session_data(row[0])
-            st.success("Dagens data ryddet.")
-        else:
-            st.info("Der var ingen data for den valgte dato.")
-    session_id = get_or_create_session(sel_date)
-with col2:
-    mix_mode = st.radio("Mixing", ["Random","Snake (balanceret)"], horizontal=True)
+tabs = st.tabs(["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"])
 
-players = list_players()
-pid2name = {pid:name for pid,name in players}
-
-st.subheader("Fremmøde")
-picked = st.multiselect("Vælg spillere", [name for _,name in players], default=[pid2name.get(pid) for pid in list_attendance(session_id)])
-picked_ids = [pid for pid,name in players if name in picked]
-if st.button("Gem fremmøde"):
-    record_attendance(session_id, picked_ids)
-    st.success("Fremmøde gemt.")
-
-# Round generator
-st.subheader("Start spil")
-courts = st.number_input("Antal baner", min_value=1, max_value=6, value=2, step=1)
-att_ids = list_attendance(session_id)
-
-if st.button("Start runde"):
-    if len(att_ids) < 2:
-        st.warning("For få spillere.")
-    else:
-        matches = make_round_matches(att_ids, int(courts), mix_mode)
-        if not matches:
-            st.warning("Kunne ikke planlægge kampe til denne runde.")
-        else:
-            st.session_state["matches"] = matches
-            st.session_state["current_session"] = session_id
-            st.success(f"Runde startet med {len(matches)} kampe.")
-
-# Active matches table
-if "matches" in st.session_state and st.session_state.get("current_session")==session_id:
-    st.subheader("Aktive kampe")
-    for idx, m in enumerate(st.session_state["matches"], start=1):
-        s1 = m["side1"]; s2 = m["side2"]
-        is_d = m["is_doubles"]
-        s1_names = " & ".join([pid2name.get(s1[0],"?")] + ([pid2name.get(s1[1],"?")] if s1[1] else []))
-        s2_names = " & ".join([pid2name.get(s2[0],"?")] + ([pid2name.get(s2[1],"?")] if s2[1] else []))
-        c1, c2, c3 = st.columns([3,3,2])
-        with c1:
-            st.write(f"{s1_names}  vs  {s2_names}  ({'Doubles' if is_d else 'Singles'})")
-        with c2:
-            sc1 = st.number_input(f"Score {s1_names}", min_value=0, max_value=11, value=11, step=1, key=f"sc1_{idx}")
-            sc2 = st.number_input(f"Score {s2_names}", min_value=0, max_value=11, value=7, step=1, key=f"sc2_{idx}")
-        with c3:
-            if st.button("Gem resultat", key=f"save_{idx}"):
-                if sc1 == sc2:
-                    st.warning("Ingen uafgjort. Justér score.")
-                else:
-                    winner = 1 if sc1 > sc2 else 2
-                    ok = save_match(session_id, is_d, s1, s2, winner, int(sc1), int(sc2))
-                    if ok:
-                        st.success("Kamp gemt.")
-                    else:
-                        st.info("Den kamp er allerede gemt (samme spillere og score i dag).")
-
-# Archive
-st.subheader("Kamp-arkiv")
-year_choice = st.number_input("År", min_value=2000, max_value=2100, value=date.today().year, step=1)
-c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
-cur.execute("SELECT id FROM sessions WHERE strftime('%Y', session_date)=?;", (str(year_choice),))
-sids = [r[0] for r in cur.fetchall()]
-rows = []
-if sids:
-    sid_tuple = "(" + ",".join("?"*len(sids)) + ")"
-    cur.execute(f"SELECT * FROM matches WHERE session_id IN {sid_tuple} ORDER BY id DESC;", sids)
-    rows = cur.fetchall()
-c.close()
-
-# Filters
-colf1, colf2, colf3, colf4 = st.columns([1,1,1,1])
-with colf1:
-    filter_player = st.selectbox("Spiller (valgfrit)", options=["- Alle -"] + [n for _,n in players])
-with colf2:
-    ftype = st.selectbox("Type", ["Alle","Singles","Doubles"])
-with colf3:
-    fresult = st.selectbox("Resultat (for valgt spiller)", ["Alle","Vundet","Tabt"])
-with colf4:
-    fsearch = st.text_input("Søg (navne)")
-
-def row_from_match(r, perspective_pid: Optional[int]=None):
-    is_d = bool(r["is_doubles"])
-    s1 = [r["side1_p1"]] + ([r["side1_p2"]] if r["side1_p2"] else [])
-    s2 = [r["side2_p1"]] + ([r["side2_p2"]] if r["side2_p2"] else [])
-    s1_names = " & ".join([pid2name.get(p,"?") for p in s1])
-    s2_names = " & ".join([pid2name.get(p,"?") for p in s2])
-    winner = 1 if r["score1"]>r["score2"] else 2
-    # date
-    c = conn(); cur = c.cursor()
-    cur.execute("SELECT session_date FROM sessions WHERE id=?;", (r["session_id"],))
-    drow = cur.fetchone(); c.close()
-    dstr = drow[0] if drow else ""
-    vinkel = ""
-    if perspective_pid and (perspective_pid in s1 or perspective_pid in s2):
-        won = (winner==1 and perspective_pid in s1) or (winner==2 and perspective_pid in s2)
-        vinkel = "Vundet" if won else "Tabt"
-    return {"Dato": dstr, "Type": "Doubles" if is_d else "Singles", "Side 1": s1_names, "Side 2": s2_names, "Resultat": f"{r['score1']}-{r['score2']}", "Vinkel": vinkel}
-
-perspective_pid = None
-if filter_player != "- Alle -":
-    for pid,name in players:
-        if name == filter_player:
-            perspective_pid = pid; break
-
-table_rows = []
-for r in rows:
-    if ftype!="Alle":
-        is_d = bool(r["is_doubles"])
-        if ftype=="Singles" and is_d: continue
-        if ftype=="Doubles" and not is_d: continue
-    row = row_from_match(r, perspective_pid)
-    if fsearch and fsearch.lower() not in (row["Side 1"] + " " + row["Side 2"]).lower():
-        continue
-    if perspective_pid and fresult!="Alle" and row["Vinkel"]!=fresult:
-        continue
-    if perspective_pid:
-        n = pid2name[perspective_pid]
-        if n not in (row["Side 1"] + " " + row["Side 2"]):
-            continue
-    table_rows.append(row)
-
-if table_rows:
-    df_arch = pd.DataFrame(table_rows)
-    st.dataframe(df_arch, use_container_width=True)
-    st.download_button("Download arkiv (CSV)", data=df_arch.to_csv(index=False).encode("utf-8"), file_name=f"kamp_arkiv_{year_choice}.csv", mime="text/csv")
-else:
-    st.caption("Ingen kampe matcher filtrene.")
-
-# League
-st.subheader("Liga")
-df = compute_standings(year_choice)
-if not df.empty:
-    # add Rival column
-    rivals = compute_rivals(year_choice)
-    rival_txt = []
-    for _,r in df.iterrows():
-        pid = int(r["pid"])
-        info = rivals.get(pid)
-        if info and info.get("opponent_id"):
-            opp = info["opponent_id"]
-            rival_txt.append(f"{pid2name.get(opp,'?')} ({info['w']}-{info['l']}, {info['winpct']}%, {info['meetings']} kampe)")
-        else:
-            rival_txt.append("(for få møder)")
-    out = df[["Spiller","Fremmøder","Kampe","Sejre","Nederlag","Sejr-%","Point i alt"]].copy()
-    out["Rival"] = rival_txt
-    st.dataframe(out, use_container_width=True)
-    st.download_button("Download liga (CSV)", data=out.to_csv(index=False).encode("utf-8"), file_name=f"liga_{year_choice}.csv", mime="text/csv")
-else:
-    st.caption("Ingen data endnu.")
+with tabs[0]:
+    # Pickleball: vælg 1v1 eller 2v2
+    sport_tab_ui("Pickleball", default_team_size=2, team_min=1, team_max=2)
+with tabs[1]:
+    # Badminton: 1v1 eller 2v2; default 2
+    sport_tab_ui("Badminton", default_team_size=2, team_min=1, team_max=2)
+with tabs[2]:
+    # Volleyball: typisk 6v6 men kan skaleres
+    sport_tab_ui("Volleyball", default_team_size=6, team_min=2, team_max=6)
+with tabs[3]:
+    # Indørs fodbold: typisk 5v5, kan 3-6
+    sport_tab_ui("Indørs fodbold", default_team_size=5, team_min=3, team_max=6)
+with tabs[4]:
+    # Indørs hockey: typisk 3v3, kan 2-5
+    sport_tab_ui("Indørs hockey", default_team_size=3, team_min=2, team_max=5)
