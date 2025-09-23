@@ -298,8 +298,8 @@ def compute_standings(year: int, sport: str) -> pd.DataFrame:
 ).reset_index(drop=True)
 
 # Tilføj en kolonne med placering der starter ved 1
-df.index = df.index + 1
-df.index.name = "Placering"
+    df.index = df.index + 1
+    df.index.name = "Placering"
 
 # -------------- Round generator --------------
 def make_round_matches(att_ids: List[int], courts: int, team_size: int, mix_mode: str) -> List[Dict]:
