@@ -470,7 +470,7 @@ with st.sidebar:
     # Ryd data
     with st.expander("Ryd data"):
         st.caption("Slet testdata under udvikling.")
-        del_sport = st.selectbox("Sport", ["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"], key="del_sport")
+        del_sport = st.selectbox("Sport", ["Pickleball","Badminton","Volleyball","Ffodbold","Hockey"], key="del_sport")
         del_date = st.date_input("Dato", value=date.today(), key="del_date")
         if st.button("Ryd dagens data for valgt sport"):
             c = conn(); cur = c.cursor()
@@ -486,7 +486,7 @@ with st.sidebar:
             reset_all()
             st.success("Alt er ryddet.")
 
-tabs = st.tabs(["Pickleball","Badminton","Volleyball","Indørs fodbold","Indørs hockey"])
+tabs = st.tabs(["Pickleball","Badminton","Volleyball","Fodbold","Hockey"])
 
 with tabs[0]:
     sport_tab_ui("Pickleball", default_team_size=2, team_min=1, team_max=2)
@@ -495,6 +495,6 @@ with tabs[1]:
 with tabs[2]:
     sport_tab_ui("Volleyball", default_team_size=6, team_min=2, team_max=6)
 with tabs[3]:
-    sport_tab_ui("Indørs fodbold", default_team_size=5, team_min=3, team_max=6)
+    sport_tab_ui("Fodbold", default_team_size=5, team_min=3, team_max=6)
 with tabs[4]:
-    sport_tab_ui("Indørs hockey", default_team_size=3, team_min=2, team_max=5)
+    sport_tab_ui("Hockey", default_team_size=3, team_min=2, team_max=5)
