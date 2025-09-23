@@ -3,7 +3,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import random
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import List, Tuple, Optional, Dict
 
 DB_PATH = "data/sondagsholdet.db"
@@ -87,15 +87,77 @@ def list_attendance(session_id: int) -> List[int]:
     rows = [r[0] for r in cur.fetchall()]
     c.close(); return rows
 
-def save_match(session_id: int, is_doubles: int, side1: Tuple[int, Optional[int]], side2: Tuple[int, Optional[int]], winner: int, score1: int, score2: int):
+def delete_session_data(session_id: int):
+    """Delete matches + attendance + the session row (safe cleanup of 'dagens data')."""
+    c = conn(); cur = c.cursor()
+    cur.execute("DELETE FROM matches WHERE session_id=?;", (session_id,))
+    cur.execute("DELETE FROM attendance WHERE session_id=?;", (session_id,))
+    cur.execute("DELETE FROM sessions WHERE id=?;", (session_id,))
+    c.commit(); c.close()
+
+def reset_all():
+    """Drop everything (hard reset)."""
+    c = conn(); cur = c.cursor()
+    cur.executescript("""
+    DROP TABLE IF EXISTS matches;
+    DROP TABLE IF EXISTS attendance;
+    DROP TABLE IF EXISTS sessions;
+    DROP TABLE IF EXISTS players;
+    """)
+    c.commit(); c.close()
+    init_db()
+
+def normalize_side_tuple(is_doubles: int, side: Tuple[int, Optional[int]]) -> Tuple[int, Optional[int]]:
+    """Return side as sorted (p1<=p2) tuple for robust comparison (order independent)."""
+    p = [side[0]] + ([side[1]] if side[1] else [])
+    p = sorted([x for x in p if x is not None])
+    if is_doubles:
+        return (p[0], p[1])
+    else:
+        return (p[0], None)
+
+def match_exists(session_id: int, is_doubles: int, side1: Tuple[int, Optional[int]], side2: Tuple[int, Optional[int]], score1: int, score2: int) -> bool:
+    """
+    Prevent saving same match repeatedly.
+    Rule: within the same session, if there already exists a match with the SAME unordered participants and the SAME score (either 11-7 or 7-11 etc.), it's a duplicate.
+    """
+    s1 = normalize_side_tuple(is_doubles, side1)
+    s2 = normalize_side_tuple(is_doubles, side2)
+    # create canonical order: smaller first by tuple
+    if s2 < s1:
+        s1, s2 = s2, s1
+        score1, score2 = score2, score1  # align score with sides flip
+    c = conn(); c.row_factory = sqlite3.Row; cur = c.cursor()
+    cur.execute("""
+        SELECT side1_p1, side1_p2, side2_p1, side2_p2, score1, score2
+        FROM matches
+        WHERE session_id=? AND is_doubles=?
+    """, (session_id, is_doubles))
+    rows = cur.fetchall()
+    c.close()
+    for r in rows:
+        a = normalize_side_tuple(is_doubles, (r["side1_p1"], r["side1_p2"]))
+        b = normalize_side_tuple(is_doubles, (r["side2_p1"], r["side2_p2"]))
+        ra, rb = (a, b) if a <= b else (b, a)
+        # flip score accordingly
+        rsc1, rsc2 = (r["score1"], r["score2"]) if (a, b)==(ra, rb) else (r["score2"], r["score1"])
+        if ra == s1 and rb == s2 and rsc1 == score1 and rsc2 == score2:
+            return True
+    return False
+
+def save_match(session_id: int, is_doubles: int, side1: Tuple[int, Optional[int]], side2: Tuple[int, Optional[int]], winner: int, score1: int, score2: int) -> bool:
+    """Returns True if saved, False if rejected by duplicate guard."""
+    if match_exists(session_id, is_doubles, side1, side2, score1, score2):
+        return False
     c = conn(); cur = c.cursor()
     cur.execute("""
         INSERT INTO matches(session_id, is_doubles, side1_p1, side1_p2, side2_p1, side2_p2, winning_side, score1, score2)
         VALUES (?,?,?,?,?,?,?,?,?);
     """, (session_id, is_doubles, side1[0], side1[1], side2[0], side2[1], winner, score1, score2))
     c.commit(); c.close()
+    return True
 
-# ---------------- Helpers ----------------
+# ---------------- Stats ----------------
 def compute_standings(year: int) -> pd.DataFrame:
     c = conn(); cur = c.cursor()
     cur.execute("SELECT id,name FROM players;")
@@ -170,13 +232,9 @@ def compute_rivals(year: int) -> Dict[int, Dict]:
         result[A] = {"opponent_id": B, "w": w, "l": l, "meetings": -neg, "winpct": round(wr*100,1)}
     c.close(); return result
 
-# ---------------- Round generator (maximize players on courts) ----------------
+# ---------------- Round generator ----------------
 def make_round_matches(att_ids: List[int], courts: int, mix_mode: str) -> List[Dict]:
-    """
-    Returns a list of match dicts with keys:
-        is_doubles (int 1/0), side1(tuple), side2(tuple)
-    Strategy: choose d doubles and s singles to maximize used players with <= courts.
-    """
+    """Maximize players on court per runde by choosing d doubles and s singles within available courts."""
     if not att_ids or courts <= 0: return []
     ids = att_ids[:]
 
@@ -204,19 +262,17 @@ def make_round_matches(att_ids: List[int], courts: int, mix_mode: str) -> List[D
             best = cand
     used, d, s = best
 
-    # pick players: first 4d for doubles, next 2s for singles
     doubles_players = ids[:4*d]
     singles_players = ids[4*d:4*d+2*s]
 
     matches = []
-    # build doubles matches
+    # build doubles matches (pair adjacent into teams, then teams into matches)
     teams = []
     for i in range(0, len(doubles_players), 2):
         teams.append( (doubles_players[i], doubles_players[i+1]) )
     for j in range(0, len(teams), 2):
-        t1 = teams[j]
-        t2 = teams[j+1] if j+1 < len(teams) else None
-        if t2:
+        if j+1 < len(teams):
+            t1, t2 = teams[j], teams[j+1]
             matches.append({"is_doubles":1, "side1":(t1[0], t1[1]), "side2":(t2[0], t2[1])})
 
     # build singles matches
@@ -236,6 +292,7 @@ init_db()
 
 with st.sidebar:
     st.header("Indstillinger")
+    # Add player
     with st.form("add_player_form", clear_on_submit=True):
         nm = st.text_input("Tilføj spiller")
         submitted = st.form_submit_button("Gem spiller")
@@ -262,11 +319,33 @@ with st.sidebar:
         with open(DB_PATH, "wb") as f:
             f.write(uploaded.getbuffer())
         st.success("Database gendannet. Genindlæs siden for at se ændringer.")
+    # Dangerous ops
+    with st.expander("Ryd data"):
+        st.caption("Brug disse knapper med omtanke i testfasen.")
+        if st.button("Ryd dagens data (matches + fremmøde for valgt dato)"):
+            # We'll delete the session below after we know which date is chosen.
+            st.session_state["_delete_today_requested"] = True
+        if st.button("Ryd ALT (drop hele databasen)"):
+            reset_all()
+            st.success("Alt er ryddet.")
 
-# Session and attendance
+# Session & attendance
 col1, col2 = st.columns([1,1])
 with col1:
     sel_date = st.date_input("Dato", value=date.today())
+    # If user asked to delete today's data:
+    if st.session_state.get("_delete_today_requested"):
+        # Only run once per click
+        st.session_state["_delete_today_requested"] = False
+        # Try to find session by date; if doesn't exist, just ignore
+        c = conn(); cur = c.cursor()
+        cur.execute("SELECT id FROM sessions WHERE session_date=?;", (sel_date.isoformat(),))
+        row = cur.fetchone()
+        if row:
+            delete_session_data(row[0])
+            st.success("Dagens data ryddet.")
+        else:
+            st.info("Der var ingen data for den valgte dato.")
     session_id = get_or_create_session(sel_date)
 with col2:
     mix_mode = st.radio("Mixing", ["Random","Snake (balanceret)"], horizontal=True)
@@ -301,7 +380,6 @@ if st.button("Start runde"):
 # Active matches table
 if "matches" in st.session_state and st.session_state.get("current_session")==session_id:
     st.subheader("Aktive kampe")
-    # Render as structured rows with inputs
     for idx, m in enumerate(st.session_state["matches"], start=1):
         s1 = m["side1"]; s2 = m["side2"]
         is_d = m["is_doubles"]
@@ -319,8 +397,11 @@ if "matches" in st.session_state and st.session_state.get("current_session")==se
                     st.warning("Ingen uafgjort. Justér score.")
                 else:
                     winner = 1 if sc1 > sc2 else 2
-                    save_match(session_id, is_d, s1, s2, winner, int(sc1), int(sc2))
-                    st.success("Kamp gemt.")
+                    ok = save_match(session_id, is_d, s1, s2, winner, int(sc1), int(sc2))
+                    if ok:
+                        st.success("Kamp gemt.")
+                    else:
+                        st.info("Den kamp er allerede gemt (samme spillere og score i dag).")
 
 # Archive
 st.subheader("Kamp-arkiv")
@@ -415,3 +496,4 @@ if not df.empty:
     st.download_button("Download liga (CSV)", data=out.to_csv(index=False).encode("utf-8"), file_name=f"liga_{year_choice}.csv", mime="text/csv")
 else:
     st.caption("Ingen data endnu.")
+'''
