@@ -496,4 +496,3 @@ if not df.empty:
     st.download_button("Download liga (CSV)", data=out.to_csv(index=False).encode("utf-8"), file_name=f"liga_{year_choice}.csv", mime="text/csv")
 else:
     st.caption("Ingen data endnu.")
-'''
